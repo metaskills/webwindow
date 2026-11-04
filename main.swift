@@ -1,4 +1,5 @@
 import Cocoa
+import CoreAudio
 import WebKit
 
 let defaultURL = "https://www.twitch.tv"
@@ -95,6 +96,115 @@ final class RootView: NSView {
     }
 }
 
+// WebKit plays page audio from a shared Apple helper process (com.apple.WebKit.GPU), so
+// per-app audio mixers can't tell it belongs to WebWindow and often file it under Safari.
+// The relay taps our own helpers, mutes them, and replays the sound from this process so
+// the audio shows up as WebWindow. Needs macOS 14.2+ and the System Audio Recording permission.
+func caAddress(_ sel: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+}
+func caGet(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector) -> UInt32 {
+    var addr = caAddress(sel); var v: UInt32 = 0; var size = UInt32(MemoryLayout<UInt32>.size)
+    return AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &v) == noErr ? v : 0
+}
+func caDeviceUID(_ dev: AudioObjectID) -> String {
+    var addr = caAddress(kAudioDevicePropertyDeviceUID)
+    var uid: Unmanaged<CFString>?; var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &uid) == noErr else { return "" }
+    return uid?.takeRetainedValue() as String? ?? ""
+}
+
+@available(macOS 14.2, *)
+final class AudioRelay {
+    typealias RespFn = @convention(c) (pid_t) -> pid_t
+    let responsible: RespFn? = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "responsibility_get_pid_responsible_for_pid")
+        .map { unsafeBitCast($0, to: RespFn.self) }
+    var tapped: [AudioObjectID] = []
+    var tapID = AudioObjectID(kAudioObjectUnknown)
+    var aggID = AudioObjectID(kAudioObjectUnknown)
+    var procID: AudioDeviceIOProcID?
+    var timer: Timer?
+
+    let system = AudioObjectID(kAudioObjectSystemObject)
+
+    func start() {
+        // Helpers come and go (crashes, new pages), so look again every couple of seconds.
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        // Follow the system output device when the user switches it.
+        var addr = caAddress(kAudioHardwarePropertyDefaultOutputDevice)
+        AudioObjectAddPropertyListenerBlock(system, &addr, .main) { [weak self] _, _ in self?.refresh(force: true) }
+        refresh()
+    }
+
+    // Core Audio process objects for WebKit helpers that belong to this app.
+    func ourHelpers() -> [AudioObjectID] {
+        var addr = caAddress(kAudioHardwarePropertyProcessObjectList)
+        var size: UInt32 = 0
+        AudioObjectGetPropertyDataSize(system, &addr, 0, nil, &size)
+        var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &ids)
+        let me = getpid()
+        return ids.filter { id in
+            let pid = pid_t(bitPattern: caGet(id, kAudioProcessPropertyPID))
+            return pid != me && responsible?(pid) == me
+        }.sorted()
+    }
+
+    func refresh(force: Bool = false) {
+        let helpers = ourHelpers()
+        guard force || helpers != tapped else { return }
+        stop()
+        tapped = helpers
+        guard !helpers.isEmpty else { return }
+
+        let desc = CATapDescription(stereoMixdownOfProcesses: helpers)
+        desc.muteBehavior = .mutedWhenTapped
+        desc.isPrivate = true
+        var err = AudioHardwareCreateProcessTap(desc, &tapID)
+        guard err == noErr else { NSLog("WebWindow audio relay: tap failed (\(err))"); return }
+
+        let outUID = caDeviceUID(caGet(system, kAudioHardwarePropertyDefaultOutputDevice))
+        let agg: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "WebWindow Relay",
+            kAudioAggregateDeviceUIDKey: "\(Bundle.main.bundleIdentifier ?? "webwindow").relay.\(UUID().uuidString)",
+            kAudioAggregateDeviceMainSubDeviceKey: outUID,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outUID]],
+            kAudioAggregateDeviceTapListKey: [[kAudioSubTapUIDKey: desc.uuid.uuidString, kAudioSubTapDriftCompensationKey: true]],
+        ]
+        err = AudioHardwareCreateAggregateDevice(agg as CFDictionary, &aggID)
+        guard err == noErr else { NSLog("WebWindow audio relay: aggregate device failed (\(err))"); stop(); return }
+
+        // Copy tap input straight to the output device's buffers.
+        err = AudioDeviceCreateIOProcIDWithBlock(&procID, aggID, nil) { _, inData, _, outData, _ in
+            let ins = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inData))
+            let outs = UnsafeMutableAudioBufferListPointer(outData)
+            for (i, out) in outs.enumerated() {
+                guard let dst = out.mData else { continue }
+                if i < ins.count, let src = ins[i].mData {
+                    let n = min(out.mDataByteSize, ins[i].mDataByteSize)
+                    memcpy(dst, src, Int(n))
+                    if n < out.mDataByteSize { memset(dst + Int(n), 0, Int(out.mDataByteSize - n)) }
+                } else {
+                    memset(dst, 0, Int(out.mDataByteSize))
+                }
+            }
+        }
+        guard err == noErr, let procID else { NSLog("WebWindow audio relay: IOProc failed (\(err))"); stop(); return }
+        err = AudioDeviceStart(aggID, procID)
+        if err != noErr { NSLog("WebWindow audio relay: start failed (\(err))"); stop() }
+    }
+
+    func stop() {
+        if let procID, aggID != kAudioObjectUnknown { AudioDeviceStop(aggID, procID); AudioDeviceDestroyIOProcID(aggID, procID) }
+        procID = nil
+        if aggID != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(aggID); aggID = AudioObjectID(kAudioObjectUnknown) }
+        if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID); tapID = AudioObjectID(kAudioObjectUnknown) }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
     var window: NSWindow!
     var webView: WKWebView!
@@ -102,6 +212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var titleObservation: NSKeyValueObservation?
     var urlObservation: NSKeyValueObservation?
     var popups: [NSWindow] = []
+    var relay: AnyObject?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
@@ -157,6 +268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         config.preferences.isElementFullscreenEnabled = true
         config.mediaTypesRequiringUserActionForPlayback = []
         config.applicationNameForUserAgent = "Version/26.0 Safari/605.1.15"
+        if #available(macOS 14.2, *) { let r = AudioRelay(); relay = r; r.start() }
 
         webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self

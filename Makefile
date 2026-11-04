@@ -8,7 +8,7 @@ LSREGISTER := /System/Library/Frameworks/CoreServices.framework/Frameworks/Launc
 build:
 	rm -rf $(BUILD)
 	mkdir -p $(BUILD)/Contents/MacOS $(BUILD)/Contents/Resources
-	swiftc -O -o $(BUILD)/Contents/MacOS/WebWindow main.swift -framework Cocoa -framework WebKit
+	swiftc -O -o $(BUILD)/Contents/MacOS/WebWindow main.swift -framework Cocoa -framework WebKit -framework CoreAudio
 	cp Info.plist $(BUILD)/Contents/Info.plist
 	cp AppIcon.icns $(BUILD)/Contents/Resources/AppIcon.icns
 	codesign --force --sign - $(BUILD)
