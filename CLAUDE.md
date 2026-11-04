@@ -21,7 +21,7 @@
 
 Every browser wants to be your workspace. Tabs, toolbars, sidebars, extensions, a URL bar that never stops asking for attention.
 
-**WebWindow wants to be a window.** One site, one native macOS window, nothing around it. Park a stream next to your editor, pin a dashboard on a second monitor, keep a chat open without a browser eating half the screen. It's ~380 lines of Swift on top of the WebKit engine that already ships with your Mac.
+**WebWindow wants to be a window.** One site, one native macOS window, nothing around it. Park a stream next to your editor, pin a dashboard on a second monitor, keep a chat open without a browser eating half the screen. It's ~400 lines of Swift on top of the WebKit engine that already ships with your Mac.
 
 <br>
 

@@ -107,6 +107,11 @@ func caGet(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector) -> UInt32 {
     var addr = caAddress(sel); var v: UInt32 = 0; var size = UInt32(MemoryLayout<UInt32>.size)
     return AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &v) == noErr ? v : 0
 }
+func caInputStreamCount(_ dev: AudioObjectID) -> Int {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: kAudioObjectPropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    return AudioObjectGetPropertyDataSize(dev, &addr, 0, nil, &size) == noErr ? Int(size) / MemoryLayout<AudioStreamID>.size : 0
+}
 func caDeviceUID(_ dev: AudioObjectID) -> String {
     var addr = caAddress(kAudioDevicePropertyDeviceUID)
     var uid: Unmanaged<CFString>?; var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
@@ -127,7 +132,27 @@ final class AudioRelay {
 
     let system = AudioObjectID(kAudioObjectSystemObject)
 
+    // A tap without permission still mutes the helper but captures silence, so only tap once
+    // System Audio Recording is granted. There is no public API to ask; TCC is the private
+    // framework other capture tools use. If it's missing, fall back to asking via the tap.
+    typealias Preflight = @convention(c) (CFString, CFDictionary?) -> Int
+    typealias Request = @convention(c) (CFString, CFDictionary?, @escaping @convention(block) (Bool) -> Void) -> Void
+    let tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC", RTLD_NOW)
+    let service = "kTCCServiceAudioCapture" as CFString
+
     func start() {
+        guard let pre = dlsym(tcc, "TCCAccessPreflight"), let req = dlsym(tcc, "TCCAccessRequest") else { return begin() }
+        switch unsafeBitCast(pre, to: Preflight.self)(service, nil) {
+        case 0: begin()  // granted
+        case 1: NSLog("WebWindow audio relay: System Audio Recording denied, audio plays unrelayed")
+        default:
+            unsafeBitCast(req, to: Request.self)(service, nil) { ok in
+                if ok { DispatchQueue.main.async { self.begin() } }
+            }
+        }
+    }
+
+    func begin() {
         // Helpers come and go (crashes, new pages), so look again every couple of seconds.
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
         // Follow the system output device when the user switches it.
@@ -163,7 +188,11 @@ final class AudioRelay {
         var err = AudioHardwareCreateProcessTap(desc, &tapID)
         guard err == noErr else { NSLog("WebWindow audio relay: tap failed (\(err))"); return }
 
-        let outUID = caDeviceUID(caGet(system, kAudioHardwarePropertyDefaultOutputDevice))
+        let outDev = caGet(system, kAudioHardwarePropertyDefaultOutputDevice)
+        let outUID = caDeviceUID(outDev)
+        // The aggregate's input lists the output device's own inputs (a headset or interface
+        // mic) first, then the tap. Skip past them so we relay the tap, not the mic.
+        let skip = caInputStreamCount(outDev)
         let agg: [String: Any] = [
             kAudioAggregateDeviceNameKey: "WebWindow Relay",
             kAudioAggregateDeviceUIDKey: "\(Bundle.main.bundleIdentifier ?? "webwindow").relay.\(UUID().uuidString)",
@@ -183,8 +212,8 @@ final class AudioRelay {
             let outs = UnsafeMutableAudioBufferListPointer(outData)
             for (i, out) in outs.enumerated() {
                 guard let dst = out.mData else { continue }
-                if i < ins.count, let src = ins[i].mData {
-                    let n = min(out.mDataByteSize, ins[i].mDataByteSize)
+                if i + skip < ins.count, let src = ins[i + skip].mData {
+                    let n = min(out.mDataByteSize, ins[i + skip].mDataByteSize)
                     memcpy(dst, src, Int(n))
                     if n < out.mDataByteSize { memset(dst + Int(n), 0, Int(out.mDataByteSize - n)) }
                 } else {
