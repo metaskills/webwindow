@@ -59,7 +59,7 @@ To remove it: `make uninstall` (same `PREFIX` if you used one).
 
 ## Use
 
-Launch it and it asks where to go. The default is `https://www.twitch.tv`, and it remembers the last place you went. Type `example.com` and it adds the `https://` for you.
+Launch it and it asks where to go. The first time, that is `https://www.twitch.tv`. After that it offers whatever page you were on when you quit, so <kbd>Return</kbd> puts you right back. Type `example.com` and it adds the `https://` for you.
 
 | Keys | Does |
 | --- | --- |
@@ -69,7 +69,7 @@ Launch it and it asks where to go. The default is `https://www.twitch.tv`, and i
 | <kbd>⌃</kbd> <kbd>⌘</kbd> <kbd>F</kbd> | Full screen |
 | <kbd>⌘</kbd> <kbd>W</kbd> / <kbd>⌘</kbd> <kbd>Q</kbd> | Close / quit |
 
-Links that try to open a new tab load in the same window. Video fullscreen and autoplay work.
+Links that try to open a new tab load in the same window. Sign-in popups (like "Sign in with Google") open in their own small window and close when done. Video fullscreen and autoplay work.
 
 <br>
 

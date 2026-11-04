@@ -100,6 +100,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var webView: WKWebView!
     var root: RootView!
     var titleObservation: NSKeyValueObservation?
+    var urlObservation: NSKeyValueObservation?
+    var popups: [NSWindow] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
@@ -175,6 +177,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         window.setFrameAutosaveName("MainWindow")
         window.title = url.host ?? "WebWindow"
         root.bar.label.stringValue = window.title
+        // Remember wherever the page ends up so the next launch starts there.
+        urlObservation = webView.observe(\.url) { wv, _ in
+            if let u = wv.url, ["http", "https"].contains(u.scheme ?? "") {
+                UserDefaults.standard.set(u.absoluteString, forKey: lastURLKey)
+            }
+        }
         titleObservation = webView.observe(\.title) { [weak self] wv, _ in
             if let t = wv.title, !t.isEmpty { self?.window.title = t; self?.root.bar.label.stringValue = t }
         }
@@ -182,11 +190,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         webView.load(URLRequest(url: url))
     }
 
-    // Links that want a new window open in the same view.
+    // Clicked links that want a new tab open in the same view. Script-opened popups
+    // (window.open, used by "Sign in with Google" and friends) get a real popup window
+    // built from the supplied configuration, so window.opener and postMessage keep working.
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
-        return nil
+        if navigationAction.navigationType == .linkActivated {
+            if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
+            return nil
+        }
+        let w = CGFloat(windowFeatures.width?.doubleValue ?? 500)
+        let h = CGFloat(windowFeatures.height?.doubleValue ?? 650)
+        let popup = WKWebView(frame: NSRect(x: 0, y: 0, width: w, height: h), configuration: configuration)
+        popup.navigationDelegate = self
+        popup.uiDelegate = self
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: w, height: h),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        win.isReleasedWhenClosed = false
+        win.contentView = popup
+        win.center()
+        win.makeKeyAndOrderFront(nil)
+        popups.append(win)
+        return popup
+    }
+
+    // window.close() from the page (the sign-in popup does this when finished).
+    func webViewDidClose(_ webView: WKWebView) {
+        guard let win = webView.window, win !== window else { return }
+        win.close()
+        popups.removeAll { $0 === win }
     }
 
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
